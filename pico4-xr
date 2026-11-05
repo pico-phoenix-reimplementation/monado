@@ -1,0 +1,112 @@
+#!/bin/sh
+# Run an OpenXR app on the PICO 4 panels: Monado (with the pico4 driver)
+# renders straight to the DSI connector through VK_KHR_display, no X/Wayland.
+#
+#   sudo pico4-xr hello_xr -g Vulkan2
+#   sudo pico4-xr            # service only, Ctrl-C to stop
+#
+# Head IMU + controllers come from pico4-controllers.service (--xr), which
+# starts streaming as soon as the driver socket /run/pico4-xr.sock appears.
+# Must run as root (DRM master on card0, or the X server's lease). Hold the
+# PICO button to recenter.
+set -eu
+
+prefix=${MONADO_PREFIX:-/opt/monado-pico4}
+
+# PICO4_XR_WAYLAND_USER=<uid>: Monado's IPC socket goes into that user's
+# runtime dir (and is handed to the user), so the user's desktop session
+# (KWin's VR mode) can connect as an OpenXR client.
+if [ -n "${PICO4_XR_WAYLAND_USER:-}" ]; then
+	export XDG_RUNTIME_DIR=/run/user/$PICO4_XR_WAYLAND_USER
+else
+	export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+fi
+mkdir -p "$XDG_RUNTIME_DIR"
+export XR_RUNTIME_JSON=$prefix/share/openxr/1/openxr_monado.json
+
+# Three ways to reach the panels:
+# - neither set: KHR_display index 0 is the panel pair (DSI-1, 4320x2160),
+#   Monado is DRM master and nothing else can drive DP-1;
+# - PICO4_XR_X11_DISPLAY=:N: an X server (pico4-x11-desktop: XFCE on DP-1)
+#   owns card0 and Monado leases DSI-1 from it (RandR lease,
+#   VK_EXT_acquire_xlib_display; patches/randr-output-by-name.patch picks the
+#   output by name, a DSI panel has no non-desktop property);
+# - PICO4_XR_WAYLAND_USER=<uid>: the user's Plasma session (KWin started with
+#   KWIN_NON_DESKTOP_CONNECTORS=DSI-1) owns card0 and offers DSI-1 through
+#   wp_drm_lease_v1; Monado leases it (VK_EXT_acquire_drm_display).
+if [ -n "${PICO4_XR_WAYLAND_USER:-}" ]; then
+	export XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1
+	export XRT_COMPOSITOR_WAYLAND_CONNECTOR=${XRT_COMPOSITOR_WAYLAND_CONNECTOR:-DSI-1}
+	# KWin picks the first free wayland-N; take the socket it holds the lock of.
+	i=0
+	while [ -z "${WAYLAND_DISPLAY:-}" ] && [ $i -lt 120 ]; do
+		for sock in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do
+			case "$sock" in *.lock) continue ;; esac
+			[ -S "$sock" ] && [ -e "$sock.lock" ] && export WAYLAND_DISPLAY=${sock##*/} && break
+		done
+		[ -n "${WAYLAND_DISPLAY:-}" ] && break
+		i=$((i + 1))
+		sleep 1
+	done
+elif [ -n "${PICO4_XR_X11_DISPLAY:-}" ]; then
+	export DISPLAY=$PICO4_XR_X11_DISPLAY
+	export XAUTHORITY=${PICO4_XR_XAUTHORITY:-/run/pico4-x11/Xauthority}
+	export XRT_COMPOSITOR_FORCE_RANDR=1
+	export XRT_COMPOSITOR_RANDR_OUTPUT=${XRT_COMPOSITOR_RANDR_OUTPUT:-DSI-1}
+	i=0
+	until xset q >/dev/null 2>&1 || [ $i -ge 60 ]; do
+		i=$((i + 1))
+		sleep 1
+	done
+else
+	export XRT_COMPOSITOR_FORCE_VK_DISPLAY=${XRT_COMPOSITOR_FORCE_VK_DISPLAY:-0}
+fi
+# Render at native size, 140% supersampling is too heavy here.
+export XRT_COMPOSITOR_SCALE_PERCENTAGE=${XRT_COMPOSITOR_SCALE_PERCENTAGE:-100}
+export PICO4_REFRESH=${PICO4_REFRESH:-72}
+# Monado defaults to the compute compositor on Linux; the graphics (mesh)
+# path has less latency here.
+export XRT_COMPOSITOR_COMPUTE=${XRT_COMPOSITOR_COMPUTE:-0}
+# Backgrounded, stdin is /dev/null, which the service cannot epoll.
+export XRT_NO_STDIN=1
+# Otherwise SDL (debug GUI) swallows SIGTERM/SIGINT and the service never quits.
+export SDL_NO_SIGNAL_HANDLERS=1
+
+log=$XDG_RUNTIME_DIR/monado-pico4.log
+# A killed service leaves its sockets behind; the wait below must not see them.
+rm -f "$XDG_RUNTIME_DIR/monado_comp_ipc" /run/pico4-xr.sock
+"$prefix/bin/monado-service" >"$log" 2>&1 &
+svc=$!
+stop() {
+	trap - EXIT INT TERM
+	kill $svc 2>/dev/null || return 0
+	i=0
+	while kill -0 $svc 2>/dev/null && [ $i -lt 30 ]; do
+		i=$((i + 1))
+		sleep 0.1
+	done
+	kill -KILL $svc 2>/dev/null || true
+	rm -f /run/pico4-xr.sock
+}
+trap stop EXIT INT TERM
+
+i=0
+until [ -S "$XDG_RUNTIME_DIR/monado_comp_ipc" ]; do
+	if ! kill -0 $svc 2>/dev/null || [ $i -ge 100 ]; then
+		echo "monado-service did not come up, see $log" >&2
+		tail -20 "$log" >&2
+		exit 1
+	fi
+	i=$((i + 1))
+	sleep 0.1
+done
+if [ -n "${PICO4_XR_WAYLAND_USER:-}" ]; then
+	chown "$PICO4_XR_WAYLAND_USER" "$XDG_RUNTIME_DIR/monado_comp_ipc"
+fi
+echo "monado-service up (log: $log)"
+
+if [ $# -eq 0 ]; then
+	wait $svc
+else
+	"$@"
+fi

@@ -1,0 +1,52 @@
+--- a/src/xrt/compositor/main/comp_window_direct_randr.c
++++ b/src/xrt/compositor/main/comp_window_direct_randr.c
+@@ -13,6 +13,9 @@
+ #include <X11/Xlib-xcb.h>
+ #include <X11/extensions/Xrandr.h>
+ 
++#include <stdlib.h>
++#include <string.h>
++
+ #include "util/u_misc.h"
+ 
+ #include "main/comp_window_direct.h"
+@@ -379,6 +382,13 @@
+ 
+ 	free(version_reply);
+ 
++	/*
++	 * XRT_COMPOSITOR_RANDR_OUTPUT=<name>: lease that output whatever its
++	 * non-desktop property says (a DSI panel has no EDID, so nothing marks it
++	 * non-desktop). X must keep the output disabled.
++	 */
++	const char *want_output = getenv("XRT_COMPOSITOR_RANDR_OUTPUT");
++
+ 	xcb_generic_error_t *error = NULL;
+ 	xcb_intern_atom_cookie_t non_desktop_cookie =
+ 	    xcb_intern_atom(connection, 1, strlen("non-desktop"), "non-desktop");
+@@ -395,7 +405,7 @@
+ 		return;
+ 	}
+ 
+-	if (non_desktop_reply->atom == XCB_NONE) {
++	if (non_desktop_reply->atom == XCB_NONE && want_output == NULL) {
+ 		free(non_desktop_reply);
+ 		COMP_ERROR(ct->c, "No output has non-desktop property");
+ 		return;
+@@ -424,6 +434,16 @@
+ 			free(output_reply);
+ 			continue;
+ 		}
++
++		if (want_output != NULL) {
++			const char *name = (const char *)xcb_randr_get_output_info_name(output_reply);
++			int len = xcb_randr_get_output_info_name_length(output_reply);
++			if ((int)strlen(want_output) == len && strncmp(name, want_output, len) == 0) {
++				append_randr_display(w, output_reply, resources_reply, xcb_outputs[i]);
++			}
++			free(output_reply);
++			continue;
++		}
+ 
+ 		// Find the first output that has the non-desktop property set.
+ 		xcb_randr_get_output_property_cookie_t prop_cookie;
